@@ -1,0 +1,27 @@
+'use client';
+
+import React from 'react';
+import dynamic from 'next/dynamic';
+import { useSearchParams } from 'next/navigation';
+
+// TileSwapApp nur im Browser rendern
+const TileSwapApp = dynamic(() => import('./TileSwapApp'), { ssr: false });
+
+export default function VisualizerClient() {
+  const sp = useSearchParams();
+
+  const tile_w = sp.get('tile_w');
+  const tile_h = sp.get('tile_h');
+  const grout  = sp.get('grout');
+  const image  = sp.get('image');
+
+  const props: Record<string, unknown> = {
+    initialTileW: tile_w ? parseFloat(tile_w) : undefined,
+    initialTileH: tile_h ? parseFloat(tile_h) : undefined,
+    initialGrout: grout  ? parseFloat(grout)  : undefined,
+    initialImageUrl: image || undefined,
+  };
+
+  // Falls TileSwapApp diese Props nicht kennt, ignoriert React sie still – kein Compile-Fehler.
+  return <TileSwapApp {...props} />;
+}

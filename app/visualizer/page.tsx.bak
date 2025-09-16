@@ -1,0 +1,14 @@
+import { Suspense } from 'react';
+import VisualizerClient from '@/components/VisualizerClient';
+
+// Verhindert Prerendering-Probleme, Seite wird dynamisch gerendert
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
+
+export default function Page() {
+  return (
+    <Suspense fallback={<div style={{padding:12}}>Lade Visualizer…</div>}>
+      <VisualizerClient />
+    </Suspense>
+  );
+}

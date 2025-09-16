@@ -1,0 +1,59 @@
+import { NextResponse } from 'next/server';
+
+/* --- Node File shim (server) --- */
+import { Blob } from "buffer";
+// @ts-ignore
+if (typeof (globalThis as any).File === "undefined") {
+  class NodeFile extends Blob {
+    name: string;
+    lastModified: number;
+    webkitRelativePath: string;
+    constructor(chunks: any[] = [], name: string = "file", options: any = {}) {
+      super(chunks, options);
+      this.name = name;
+      this.lastModified = options?.lastModified ?? Date.now();
+      this.webkitRelativePath = "";
+    }
+  }
+  // @ts-ignore
+  (globalThis as any).File = NodeFile as any;
+}
+/* --- end shim --- */
+
+
+export const runtime = 'nodejs';
+
+type FileLike = {
+  arrayBuffer: () => Promise<ArrayBuffer>;
+  name?: string;
+  type?: string;
+  size?: number;
+};
+
+function isFileLike(v: unknown): v is FileLike {
+  return !!v && typeof v === 'object'
+    && 'arrayBuffer' in (v as Record<string, unknown>)
+    && typeof (v as Record<string, unknown>).arrayBuffer === 'function';
+}
+
+export async function POST(req: Request) {
+  const form = await req.formData();
+  const f = form.get('file');
+
+  if (!isFileLike(f)) {
+    return NextResponse.json({ error: 'file missing' }, { status: 400 });
+  }
+
+  const ab = await f.arrayBuffer();
+  const buf = Buffer.from(ab);
+
+  // TODO: hier deine eigentliche Analyse-Logik mit "buf"
+  // Beispiel: an tilesvc senden oder lokal verarbeiten.
+
+  return NextResponse.json({
+    ok: true,
+    size: buf.length,
+    name: f.name ?? null,
+    type: f.type ?? null,
+  });
+}

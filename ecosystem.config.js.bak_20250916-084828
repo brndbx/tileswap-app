@@ -1,0 +1,13 @@
+module.exports = {
+  apps: [{
+    name: 'nextjs',
+    cwd: '/var/www/vhosts/gracious-boyd.217-154-3-148.plesk.page/nextjs',
+    script: './node_modules/next/dist/bin/next',
+    args: 'start -p 3001',
+    env: {
+      NODE_ENV: 'production',
+      HOST: '0.0.0.0',   // auf allen Interfaces lauschen (einschließlich 127.0.0.1)
+      PORT: '3001'
+    }
+  }]
+}

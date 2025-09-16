@@ -1,0 +1,492 @@
+"use client";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+
+type Pt = { x: number; y: number };
+type AnalyzeResp = {
+  tile_w: number; tile_h: number; grout: number;
+  shading_png_b64?: string; occluder_png_b64?: string; H?: number[];
+};
+
+async function compressImage(file: File, maxDim = 2000, quality = 0.9): Promise<Blob> {
+  const bmp = await createImageBitmap(file);
+  const scale = Math.min(1, maxDim / Math.max(bmp.width, bmp.height));
+  const w = Math.max(1, Math.round(bmp.width * scale));
+  const h = Math.max(1, Math.round(bmp.height * scale));
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  c.getContext("2d")!.drawImage(bmp, 0, 0, w, h);
+  return await new Promise((resolve, reject) =>
+    c.toBlob(b => (b ? resolve(b) : reject(new Error("toBlob failed"))), "image/jpeg", quality)
+  );
+}
+
+/** Bilinear: (u,v in [0,1]) -> Punkt im 4-Eck p0..p3. */
+function mapQuadBilinear(u: number, v: number, P: Pt[]): Pt {
+  const p0 = P[0], p1 = P[1], p2 = P[2], p3 = P[3];
+  const x = (1 - u) * (1 - v) * p0.x + u * (1 - v) * p1.x + u * v * p2.x + (1 - u) * v * p3.x;
+  const y = (1 - u) * (1 - v) * p0.y + u * (1 - v) * p1.y + u * v * p2.y + (1 - u) * v * p3.y;
+  return { x, y };
+}
+
+/** Projektiv: (u,v in [0,1]) via 3x3-Homographie (row-major: [h00..h22]). */
+function mapProjective(u: number, v: number, H: number[]): Pt {
+  const x = H[0]*u + H[1]*v + H[2];
+  const y = H[3]*u + H[4]*v + H[5];
+  const w = H[6]*u + H[7]*v + H[8];
+  const iw = w !== 0 ? 1/w : 1e-9;
+  return { x: x*iw, y: y*iw };
+}
+
+/** Affine Transformation: src-Dreieck -> dst-Dreieck => [a,b,c,d,e,f] für ctx.setTransform */
+function affineFromTriangles(src: [Pt, Pt, Pt], dst: [Pt, Pt, Pt]): [number, number, number, number, number, number] {
+  const [s1, s2, s3] = src; const [d1, d2, d3] = dst;
+  const x1=s1.x,y1=s1.y,x2=s2.x,y2=s2.y,x3=s3.x,y3=s3.y;
+  const X1=d1.x,Y1=d1.y,X2=d2.x,Y2=d2.y,X3=d3.x,Y3=d3.y;
+  const det = x1*(y2-y3) - y1*(x2-x3) + (x2*y3 - x3*y2);
+  if (Math.abs(det) < 1e-8) return [1,0,0,1,0,0];
+  const inv00=(y2-y3)/det, inv01=(x3-x2)/det, inv02=(x2*y3-x3*y2)/det;
+  const inv10=(y3-y1)/det, inv11=(x1-x3)/det, inv12=(x3*y1-x1*y3)/det;
+  const inv20=(y1-y2)/det, inv21=(x2-x1)/det, inv22=(x1*y2-x2*y1)/det;
+  const a = inv00*X1 + inv01*X2 + inv02*X3;
+  const c = inv10*X1 + inv11*X2 + inv12*X3;
+  const e = inv20*X1 + inv21*X2 + inv22*X3;
+  const b = inv00*Y1 + inv01*Y2 + inv02*Y3;
+  const d = inv10*Y1 + inv11*Y2 + inv12*Y3;
+  const f = inv20*Y1 + inv21*Y2 + inv22*Y3;
+  return [a,b,c,d,e,f];
+}
+
+export default function TileSwapApp() {
+
+  const [scalePxPerMm, setScalePxPerMm] = useState<number | null>(null);
+  useEffect(() => {
+    try {
+      const v = typeof window !== "undefined" ? window.localStorage.getItem("scale_px_per_mm") : null;
+      if (v) {
+        const n = parseFloat(v);
+        if (Number.isFinite(n) && n > 0) setScalePxPerMm(n);
+      }
+    } catch (_) {}
+  }, []);
+
+  const [image, setImage] = useState<HTMLImageElement | null>(null);
+  const [points, setPoints] = useState<Pt[]>([]);
+  const [dragIndex, setDragIndex] = useState<number | null>(null);
+  const [hoverIndex, setHoverIndex] = useState<number | null>(null);
+
+  const [tileW, setTileW] = useState<number>(120);
+  const [tileH, setTileH] = useState<number>(120);
+  const [grout, setGrout] = useState<number>(4);
+  const [groutColor, setGroutColor] = useState<string>("#d9d9d9");
+  const [layout, setLayout] = useState<"stacked" | "offset">("stacked");
+  const [pattern, setPattern] = useState<"plain" | "checker" | "subway">("plain");
+  const [opacity, setOpacity] = useState<number>(100);
+  const [showOverlay, setShowOverlay] = useState<boolean>(true);
+  const [busy, setBusy] = useState<boolean>(false);
+
+  // Service/Debug
+  const [lastResp, setLastResp] = useState<AnalyzeResp | null>(null);
+  const [shadingLoaded, setShadingLoaded] = useState<boolean>(false);
+  const [maskLoaded, setMaskLoaded] = useState<boolean>(false);
+  const [useShading, setUseShading] = useState<boolean>(true);
+  const [useMask, setUseMask] = useState<boolean>(true);
+  const [invertMask, setInvertMask] = useState<boolean>(false);
+  const [usePerspective, setUsePerspective] = useState<boolean>(true);
+
+  const baseCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const uiCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const shadingCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const occluderCanvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  // Upload & Analyze
+  async function sendToAnalyze(original: File): Promise<AnalyzeResp> {
+    const payload = await compressImage(original, 2000, 0.9);
+    const form = new FormData();
+    form.append("file", new File([payload], (original.name || "upload").replace(/\.\w+$/, "") + ".jpg", { type: "image/jpeg" }));
+    form.append("points", JSON.stringify(points)); // die 4 Eckpunkte
+    const res = await fetch("/nextjs/api/analyze", { method: "POST", body: form });
+    if (!res.ok) throw new Error(`Analyze failed ${res.status}`);
+    return (await res.json()) as AnalyzeResp;
+  }
+
+  function drawB64ToCanvas(b64: string, target: HTMLCanvasElement) {
+    return new Promise<void>((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        target.width = img.width; target.height = img.height;
+        const ctx = target.getContext("2d"); if (!ctx) return reject(new Error("2D ctx missing"));
+        ctx.clearRect(0, 0, target.width, target.height);
+        ctx.drawImage(img, 0, 0); resolve();
+      };
+      img.onerror = () => reject(new Error("img load failed"));
+      img.src = b64.startsWith("data:") ? b64 : `data:image/png;base64,${b64}`;
+    });
+  }
+
+  async function onFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    const url = URL.createObjectURL(f);
+    const img = new Image();
+    img.onload = async () => {
+      setImage(img);
+      const w = img.naturalWidth, h = img.naturalHeight;
+      [baseCanvasRef.current, overlayCanvasRef.current, uiCanvasRef.current].forEach(c => { if (c) { c.width = w; c.height = h; }});
+      const inset = Math.round(Math.min(w, h) * 0.1);
+      setPoints([
+        { x: inset, y: inset },
+        { x: w - inset, y: inset },
+        { x: w - inset, y: h - inset },
+        { x: inset, y: h - inset },
+      ]);
+      try {
+        setBusy(true);
+        const r = await sendToAnalyze(f);
+        setLastResp(r);
+        if (Number.isFinite(r.tile_w)) setTileW(Math.max(40, Math.min(300, Math.round(r.tile_w))));
+        if (Number.isFinite(r.tile_h)) setTileH(Math.max(40, Math.min(300, Math.round(r.tile_h))));
+        if (Number.isFinite(r.grout))  setGrout(Math.max(0,  Math.min(20,  Math.round(r.grout))));
+        setShadingLoaded(false); setMaskLoaded(false);
+        if (r.shading_png_b64 && shadingCanvasRef.current) { await drawB64ToCanvas(r.shading_png_b64, shadingCanvasRef.current); setShadingLoaded(true); }
+        if (r.occluder_png_b64 && occluderCanvasRef.current) { await drawB64ToCanvas(r.occluder_png_b64, occluderCanvasRef.current); setMaskLoaded(true); }
+      } catch (err) {
+        alert((err as Error).message);
+        console.error(err);
+      } finally { setBusy(false); }
+    };
+    img.crossOrigin = "anonymous";
+    img.src = url;
+  }
+
+  // Base zeichnen
+  useEffect(() => {
+    const c = baseCanvasRef.current; if (!c || !image) return;
+    const ctx = c.getContext("2d")!;
+    ctx.clearRect(0, 0, c.width, c.height);
+    ctx.drawImage(image, 0, 0, c.width, c.height);
+  }, [image]);
+
+  // Prozedurales Einzel-Tile
+  const tileTexture = useMemo<HTMLCanvasElement | null>(() => {
+    if (typeof document === "undefined") return null;
+    const t = document.createElement("canvas");
+    const tw = Math.max(8, Math.floor(tileW));
+    const th = Math.max(8, Math.floor(tileH));
+    t.width = tw; t.height = th;
+    const ctx = t.getContext("2d")!;
+    ctx.fillStyle = "#eee"; ctx.fillRect(0, 0, tw, th);
+    if (pattern === "checker") {
+      ctx.globalAlpha = 0.25; ctx.fillStyle = "#fff";
+      const s = Math.max(4, Math.floor(Math.min(tw, th) / 6));
+      for (let y = 0; y < th; y += s) for (let x = 0; x < tw; x += s) if ((x/s + y/s) % 2 === 0) ctx.fillRect(x, y, s, s);
+      ctx.globalAlpha = 1;
+    } else if (pattern === "subway") {
+      ctx.globalAlpha = 0.15;
+      const grad = ctx.createLinearGradient(0,0,0,th);
+      grad.addColorStop(0.25, "#fff"); grad.addColorStop(0.5, "#f5f5f5"); grad.addColorStop(0.75, "#fff");
+      ctx.fillStyle = grad; ctx.fillRect(0,0,tw,th); ctx.globalAlpha = 1;
+    }
+    const g = ctx.createRadialGradient(tw/2, th/2, Math.min(tw,th)*0.1, tw/2, th/2, Math.max(tw,th)*0.75);
+    g.addColorStop(0, "rgba(0,0,0,0)"); g.addColorStop(1, "rgba(0,0,0,0.06)");
+    ctx.fillStyle = g; ctx.fillRect(0,0,tw,th);
+    return t;
+  }, [tileW, tileH, pattern]);
+
+  const hasNonIdentityH = useMemo(() => {
+    const H = lastResp?.H;
+    if (!H || H.length !== 9) return false;
+    const I = [1,0,0, 0,1,0, 0,0,1];
+    for (let i=0;i<9;i++) if (Math.abs(H[i]-I[i])>1e-8) return true;
+    return false;
+  }, [lastResp?.H]);
+
+  // Overlay (perspektivisch mit H, sonst bilinear)
+  useEffect(() => {
+    const c = overlayCanvasRef.current;
+    const base = baseCanvasRef.current;
+    if (!c || !base || !image) return;
+    const ctx = c.getContext("2d")!;
+    ctx.clearRect(0, 0, c.width, c.height);
+    if (!showOverlay || points.length < 3) return;
+
+    ctx.save();
+    ctx.beginPath();
+    points.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
+    ctx.closePath();
+    ctx.clip();
+
+    const g = Math.max(0, grout);
+
+    if (usePerspective && tileTexture) {
+      // Rechteckgröße in Fliesenraum
+      const dist = (a: Pt, b: Pt) => Math.hypot(a.x - b.x, a.y - b.y);
+      const top = dist(points[0], points[1]);
+      const bottom = dist(points[3], points[2]);
+      const left = dist(points[0], points[3]);
+      const right = dist(points[1], points[2]);
+      const wAvg = Math.max(1, (top + bottom) / 2);
+      const hAvg = Math.max(1, (left + right) / 2);
+      const cellW = Math.max(2, tileW + g);
+      const cellH = Math.max(2, tileH + g);
+      const wTiles = Math.max(1, Math.round(wAvg / cellW));
+      const hTiles = Math.max(1, Math.round(hAvg / cellH));
+      const rectW = wTiles * cellW;
+      const rectH = hTiles * cellH;
+
+      // Pattern-Sheet bauen
+      const sheet = document.createElement("canvas");
+      sheet.width = rectW; sheet.height = rectH;
+      const sctx = sheet.getContext("2d")!;
+      sctx.fillStyle = groutColor; sctx.fillRect(0,0,rectW,rectH);
+      for (let y = 0; y < rectH; y += cellH) {
+        const offsetX = layout === "offset" ? Math.floor(cellW/2) * ((Math.floor(y/cellH) % 2 + 2) % 2) : 0;
+        for (let x = -cellW; x < rectW + cellW; x += cellW) {
+          const innerX = x + offsetX + Math.floor(g/2);
+          const innerY = y + Math.floor(g/2);
+          const innerW = Math.max(1, tileW - g);
+          const innerH = Math.max(1, tileH - g);
+          if (innerW <= 0 || innerH <= 0) continue;
+          sctx.drawImage(tileTexture, 0,0, tileTexture.width, tileTexture.height, innerX, innerY, innerW, innerH);
+        }
+      }
+
+      const step = Math.max(24, Math.min(64, Math.round((cellW + cellH) / 4)));
+      const useH = hasNonIdentityH ? (lastResp!.H as number[]) : null;
+
+      for (let y = 0; y < rectH; y += step) {
+        const y2 = Math.min(rectH, y + step);
+        for (let x = 0; x < rectW; x += step) {
+          const x2 = Math.min(rectW, x + step);
+
+          const s1: [Pt, Pt, Pt] = [{x,y},{x:x2,y},{x,y:y2}];
+          const s2: [Pt, Pt, Pt] = [{x:x2,y},{x:x2,y:y2},{x,y:y2}];
+
+          const mapFn = useH
+            ? (p: Pt): Pt => {
+                const u = rectW > 0 ? p.x / rectW : 0;
+                const v = rectH > 0 ? p.y / rectH : 0;
+                return mapProjective(u, v, useH);
+              }
+            : (p: Pt): Pt => {
+                const u = rectW > 0 ? p.x / rectW : 0;
+                const v = rectH > 0 ? p.y / rectH : 0;
+                return mapQuadBilinear(u, v, points);
+              };
+
+          const d1 = s1.map(mapFn) as [Pt,Pt,Pt];
+          const d2 = s2.map(mapFn) as [Pt,Pt,Pt];
+
+          ctx.save();
+          ctx.beginPath(); ctx.moveTo(d1[0].x, d1[0].y); ctx.lineTo(d1[1].x, d1[1].y); ctx.lineTo(d1[2].x, d1[2].y);
+          ctx.closePath(); ctx.clip();
+          { const [a,b,c,d,e,f] = affineFromTriangles(s1, d1); ctx.setTransform(a,b,c,d,e,f); ctx.drawImage(sheet, 0, 0); }
+          ctx.restore();
+
+          ctx.save();
+          ctx.beginPath(); ctx.moveTo(d2[0].x, d2[0].y); ctx.lineTo(d2[1].x, d2[1].y); ctx.lineTo(d2[2].x, d2[2].y);
+          ctx.closePath(); ctx.clip();
+          { const [a,b,c,d,e,f] = affineFromTriangles(s2, d2); ctx.setTransform(a,b,c,d,e,f); ctx.drawImage(sheet, 0, 0); }
+          ctx.restore();
+        }
+      }
+      ctx.setTransform(1,0,0,1,0,0);
+    } else {
+      // Nicht-perspektivischer Fallback
+      ctx.fillStyle = groutColor; ctx.fillRect(0,0,c.width,c.height);
+      const cellW = Math.max(2, tileW + g);
+      const cellH = Math.max(2, tileH + g);
+      if (!tileTexture) { ctx.restore(); return; }
+      const minX = Math.floor(Math.min(...points.map(p => p.x)));
+      const maxX = Math.ceil(Math.max(...points.map(p => p.x)));
+      const minY = Math.floor(Math.min(...points.map(p => p.y)));
+      const maxY = Math.ceil(Math.max(...points.map(p => p.y)));
+      for (let y = minY - cellH; y < maxY + cellH; y += cellH) {
+        const row = Math.floor((y - minY) / cellH);
+        const offsetX = layout === "offset" ? Math.floor(cellW/2) * ((row % 2 + 2) % 2) : 0;
+        for (let x = minX - cellW - offsetX; x < maxX + cellW; x += cellW) {
+          const innerX = x + offsetX + Math.floor(g/2);
+          const innerY = y + Math.floor(g/2);
+          const innerW = Math.max(1, tileW - g);
+          const innerH = Math.max(1, tileH - g);
+          if (innerW <= 0 || innerH <= 0) continue;
+          ctx.drawImage(tileTexture, 0,0,tileTexture.width,tileTexture.height, innerX,innerY,innerW,innerH);
+        }
+      }
+    }
+
+    // Shading
+    if (useShading && shadingCanvasRef.current) {
+      ctx.globalCompositeOperation = "multiply";
+      ctx.globalAlpha = 0.55;
+      ctx.drawImage(shadingCanvasRef.current, 0, 0, c.width, c.height);
+      ctx.globalAlpha = 1; ctx.globalCompositeOperation = "source-over";
+    }
+
+    // Maske (weiche Kanten)
+    if (useMask && occluderCanvasRef.current) {
+      const m = document.createElement("canvas");
+      m.width = c.width; m.height = c.height;
+      const mctx = m.getContext("2d")!;
+      mctx.filter = "blur(2px)";
+      mctx.drawImage(occluderCanvasRef.current, 0, 0, c.width, c.height);
+      ctx.globalCompositeOperation = invertMask ? "destination-in" : "destination-out";
+      ctx.drawImage(m, 0, 0);
+      ctx.globalCompositeOperation = "source-over";
+    }
+
+    // Überblendung
+    if (opacity < 100) {
+      const tmp = document.createElement("canvas");
+      tmp.width = c.width; tmp.height = c.height;
+      tmp.getContext("2d")!.drawImage(c, 0, 0);
+      ctx.clearRect(0,0,c.width,c.height);
+      ctx.globalAlpha = opacity/100;
+      ctx.drawImage(tmp, 0, 0);
+      ctx.globalAlpha = 1;
+    }
+
+    ctx.restore();
+  }, [points, tileW, tileH, grout, groutColor, layout, pattern, opacity, image, tileTexture, showOverlay, useShading, useMask, invertMask, usePerspective, hasNonIdentityH, lastResp?.H]);
+
+  // UI-Layer
+  useEffect(() => {
+    const c = uiCanvasRef.current; if (!c) return;
+    const ctx = c.getContext("2d")!;
+    ctx.clearRect(0, 0, c.width, c.height);
+    if (points.length === 0) return;
+    ctx.lineWidth = 2; ctx.strokeStyle = "rgba(0,0,0,0.7)";
+    ctx.beginPath(); points.forEach((p,i)=> i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y)); ctx.closePath(); ctx.stroke();
+    points.forEach((p,i) => {
+      const r = hoverIndex===i?7:6;
+      ctx.beginPath(); ctx.arc(p.x,p.y,r,0,Math.PI*2);
+      ctx.fillStyle = i===dragIndex? "#2563eb" : hoverIndex===i? "#0ea5e9" : "#111827";
+      ctx.fill();
+    });
+  }, [points, dragIndex, hoverIndex]);
+
+  // Dragging
+  useEffect(() => {
+    const c = uiCanvasRef.current; if (!c) return;
+    const hit = (x:number,y:number) => {
+      const r=10; for (let i=0;i<points.length;i++){ const p=points[i]; if ((p.x-x)**2+(p.y-y)**2<=r*r) return i; } return -1;
+    };
+    const down = (e: PointerEvent) => {
+      const r = c.getBoundingClientRect();
+      const x = (e.clientX-r.left)*c.width/r.width, y=(e.clientY-r.top)*c.height/r.height;
+      const i = hit(x,y); if (i>=0){ setDragIndex(i); (e.target as Element).setPointerCapture(e.pointerId); }
+    };
+    const move = (e: PointerEvent) => {
+      const r = c.getBoundingClientRect();
+      const x = (e.clientX-r.left)*c.width/r.width, y=(e.clientY-r.top)*c.height/r.height;
+      if (dragIndex!==null){ setPoints(pts=>pts.map((p,idx)=>idx===dragIndex?{x,y}:p)); } else { const i=hit(x,y); setHoverIndex(i>=0?i:null); }
+    };
+    const up = () => { setDragIndex(null); setHoverIndex(null); };
+    c.addEventListener("pointerdown", down);
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    return () => { c.removeEventListener("pointerdown", down); window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); };
+  }, [points, dragIndex]);
+
+  return (
+    <div className="min-h-screen bg-slate-50 p-6">
+      <h1 className="text-2xl font-semibold mb-2">Tile Swap – MVP</h1>
+
+      <div className="flex flex-wrap gap-3 items-center">
+        <input type="file" accept="image/*" onChange={onFileChange} />
+        <button onClick={() => setShowOverlay(s => !s)} className="px-3 py-2 rounded border bg-white" disabled={!image}>
+          {showOverlay ? "Vorher zeigen (Overlay aus)" : "Nachher zeigen (Overlay an)"}
+        </button>
+
+        <label className="inline-flex items-center gap-2 text-sm">
+          <input type="checkbox" checked={usePerspective} onChange={e => setUsePerspective(e.target.checked)} />
+          Perspektive aktiv
+        </label>
+
+        <label className="inline-flex items-center gap-2 text-sm">
+          <input type="checkbox" checked={useShading} onChange={e => setUseShading(e.target.checked)} />
+          Shading aktiv
+        </label>
+        <label className="inline-flex items-center gap-2 text-sm">
+          <input type="checkbox" checked={useMask} onChange={e => setUseMask(e.target.checked)} />
+          Maske aktiv
+        </label>
+        <label className="inline-flex items-center gap-2 text-sm">
+          <input type="checkbox" checked={invertMask} onChange={e => setInvertMask(e.target.checked)} />
+          Maske invertieren
+        </label>
+
+        {busy && <span className="text-sm">Analysiere…</span>}
+      </div>
+
+      <div className="mt-3 text-sm bg-white border rounded-lg p-3 max-w-xl">
+        <div className="font-medium mb-1">Debug</div>
+        <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+          <div>Service: tile_w / tile_h / grout</div>
+          <div>{lastResp ? `${lastResp.tile_w} / ${lastResp.tile_h} / ${lastResp.grout}` : "—"}</div>
+          <div>Set (UI): Breite / Höhe / Fuge</div>
+          <div>{tileW} / {tileH} / {grout}</div>
+          <div>Shading geladen</div><div>{shadingLoaded ? "ja" : "nein"}</div>
+          <div>Maske geladen</div><div>{maskLoaded ? "ja" : "nein"}</div>
+          <div>Perspektive</div><div>{usePerspective ? (hasNonIdentityH ? "H" : "bilinear") : "aus"}</div>
+        </div>
+      </div>
+
+      <div className="mt-4 grid gap-3 max-w-xl bg-white rounded-xl p-4 border">
+        <div>
+          <label className="text-sm font-medium">Layout</label>
+          <div className="mt-1 flex gap-2">
+            <button onClick={() => setLayout("stacked")} className={`px-3 py-1.5 rounded border ${layout==="stacked"?"bg-slate-900 text-white":""}`}>Gerade</button>
+            <button onClick={() => setLayout("offset")}  className={`px-3 py-1.5 rounded border ${layout==="offset" ?"bg-slate-900 text-white":""}`}>Versetzt 50%</button>
+          </div>
+        </div>
+
+        <div>
+          <label className="text-sm font-medium">Muster</label>
+          <div className="mt-1 flex gap-2 flex-wrap">
+            {(["plain","checker","subway"] as const).map(p => (
+              <button key={p} onClick={() => setPattern(p)} className={`px-3 py-1.5 rounded border capitalize ${pattern===p?"bg-slate-900 text-white":""}`}>{p}</button>
+            ))}
+          </div>
+        </div>
+
+        <div>
+          <label className="text-sm font-medium">Kachelbreite (px): {tileW}</label>
+          <input type="range" min={40} max={300} value={tileW} onChange={e => setTileW(parseInt(e.target.value))} className="w-full" />
+        </div>
+
+        <div>
+          <label className="text-sm font-medium">Kachelhöhe (px): {tileH}</label>
+          <input type="range" min={40} max={300} value={tileH} onChange={e => setTileH(parseInt(e.target.value))} className="w-full" />
+        </div>
+
+        <div>
+          <label className="text-sm font-medium">Fugenbreite (px): {grout}</label>
+          <input type="range" min={0} max={20} value={grout} onChange={e => setGrout(parseInt(e.target.value))} className="w-full" />
+        </div>
+
+        <div className="flex items-center gap-3">
+          <label className="text-sm font-medium">Fugenfarbe</label>
+          <input type="color" value={groutColor} onChange={e => setGroutColor(e.target.value)} />
+        </div>
+
+        <div>
+          <label className="text-sm font-medium">Überblendung (%): {opacity}</label>
+          <input type="range" min={0} max={100} value={opacity} onChange={e => setOpacity(parseInt(e.target.value))} className="w-full" />
+        </div>
+      </div>
+
+      <div className="mt-4">
+        {image && (
+          <div className="relative" style={{ width: image.naturalWidth, height: image.naturalHeight }}>
+            <canvas ref={baseCanvasRef} className="block" />
+            <canvas ref={overlayCanvasRef} className="absolute left-0 top-0" />
+            <canvas ref={uiCanvasRef} className="absolute left-0 top-0" />
+            <canvas ref={shadingCanvasRef} style={{ display: "none" }} />
+            <canvas ref={occluderCanvasRef} style={{ display: "none" }} />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

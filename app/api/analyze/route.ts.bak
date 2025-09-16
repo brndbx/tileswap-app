@@ -1,0 +1,59 @@
+export const runtime = 'nodejs';
+
+import type { NextRequest } from 'next/server';
+
+const TILE_SVC_URL =
+  process.env.TILE_SVC_URL ?? 'http://127.0.0.1:8000/analyze';
+
+// Type Guards (ohne any):
+function isRecord(val: unknown): val is Record<string, unknown> {
+  return typeof val === 'object' && val !== null;
+}
+function isBlobLike(val: unknown): val is Blob {
+  return isRecord(val) && 'size' in val && 'type' in val;
+}
+function hasStringName(val: unknown): val is { name: string } {
+  return isRecord(val) && typeof val.name === 'string';
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    const inForm = await req.formData();
+    const fileField = inForm.get('file');
+
+    if (!isBlobLike(fileField)) {
+      return new Response(
+        JSON.stringify({ error: 'missing file field' }),
+        { status: 400, headers: { 'content-type': 'application/json' } }
+      );
+    }
+
+    const filename = hasStringName(fileField) ? fileField.name : 'upload.jpg';
+
+    const outForm = new FormData();
+    outForm.append('file', fileField, filename);
+
+    const resp = await fetch(TILE_SVC_URL, { method: 'POST', body: outForm });
+    const text = await resp.text();
+    const ct = resp.headers.get('content-type') ?? 'application/json';
+
+    return new Response(text, {
+      status: resp.status,
+      headers: { 'content-type': ct },
+    });
+  } catch (err) {
+    console.error('analyze route error:', err);
+    return new Response(
+      JSON.stringify({ error: 'analyze failed' }),
+      { status: 500, headers: { 'content-type': 'application/json' } }
+    );
+  }
+}
+
+// Healthcheck
+export async function GET() {
+  return new Response(JSON.stringify({ ok: true }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  });
+}
